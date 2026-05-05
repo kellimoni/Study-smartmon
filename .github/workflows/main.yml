@@ -227,8 +227,6 @@ jobs:
           
           To connect: Use Remote Desktop Connection with the above credentials
           
-"@
-          
       - name: Maintain Persistent Connection
         run: |
           Write-Host "Starting connection maintenance loop..."
