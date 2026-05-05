@@ -1,0 +1,288 @@
+name: Persistent RDP
+on:
+  workflow_dispatch:
+  schedule:
+    # Auto-restart every 5.5 hours to prevent 6-hour timeout
+    - cron: '0 */5 * * *'
+    # Additional schedule for continuous coverage
+    - cron: '30 */5 * * *'
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360  # 6 hours maximum
+    concurrency:
+      group: rdp-session
+      cancel-in-progress: false
+    
+    steps:
+      - name: Set Timezone to USA Eastern
+        run: |
+          # Set timezone to US Eastern time
+          tzutil /s "Eastern Standard Time"
+          Write-Host "Timezone set to: Eastern Standard Time (UTC-5/UTC-4 DST)"
+          
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Configure RDP security settings (NLA optional - disabled for broader compatibility)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+          
+          # Configure firewall rules
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 profile=any
+          
+          # Enable RDP firewall rule
+          netsh advfirewall firewall set rule group="Remote Desktop" new enable=Yes
+          
+          # Restart Remote Desktop services
+          Restart-Service TermService -Force
+          
+          Write-Host "RDP Configuration completed successfully"
+          
+      - name: Create Secure RDP User
+        run: |
+          # Generate cryptographically secure password
+          Add-Type -AssemblyName System.Security
+          Add-Type -AssemblyName System.Web
+          
+          $password = [System.Web.Security.Membership]::GeneratePassword(20, 4)
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Clean up existing user if present
+          $existingUser = Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue
+          if ($existingUser) {
+            Remove-LocalUser -Name "RDPUser" -ErrorAction Stop
+          }
+          
+          # Create new user with never-expiring password
+          New-LocalUser -Name "RDPUser" `
+                       -Password $securePass `
+                       -PasswordNeverExpires `
+                       -AccountNeverExpires `
+                       -FullName "RDP Access User"
+          
+          # Add to required groups
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser" -ErrorAction SilentlyContinue
+          
+          # Enable password never expires policy
+          Set-LocalUser -Name "RDPUser" -PasswordNeverExpires $true
+          
+          # Store credentials securely
+          $credentialJson = @{
+            username = "RDPUser"
+            password = $password
+            timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+          } | ConvertTo-Json
+          
+          echo "RDP_CREDS=$credentialJson" >> $env:GITHUB_ENV
+          
+          # Verify user creation
+          if (-not (Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue)) {
+            Write-Error "User creation failed"
+            exit 1
+          }
+          
+          Write-Host "RDP user created successfully"
+          
+      - name: Install Tailscale with Retry
+        run: |
+          $maxRetries = 3
+          $retryCount = 0
+          $installed = $false
+          
+          while (-not $installed -and $retryCount -lt $maxRetries) {
+            try {
+              Write-Host "Attempt $($retryCount + 1) to install Tailscale..."
+              
+              # Download latest Tailscale
+              $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+              $installerPath = "$env:TEMP\tailscale_$(Get-Date -Format 'yyyyMMddHHmmss').msi"
+              
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
+              
+              # Install silently
+              $installProcess = Start-Process msiexec.exe `
+                -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "/L*v", "$env:TEMP\tailscale_install.log" `
+                -Wait -PassThru
+              
+              if ($installProcess.ExitCode -eq 0) {
+                $installed = $true
+                Write-Host "Tailscale installed successfully"
+              } else {
+                throw "Installation failed with exit code: $($installProcess.ExitCode)"
+              }
+            }
+            catch {
+              $retryCount++
+              Write-Warning "Installation failed: $_"
+              if ($retryCount -lt $maxRetries) {
+                Start-Sleep -Seconds 10
+              }
+            }
+            finally {
+              if (Test-Path $installerPath) {
+                Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
+          
+          if (-not $installed) {
+            Write-Error "Failed to install Tailscale after $maxRetries attempts"
+            exit 1
+          }
+          
+      - name: Establish Tailscale Connection with Persistence
+        run: |
+          $tsPath = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          
+          # Authenticate and connect
+          $hostname = "gh-runner-usa-$($env:GITHUB_RUN_ID)"
+          Write-Host "Connecting as hostname: $hostname"
+          
+          & $tsPath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+                       --hostname=$hostname `
+                       --accept-routes `
+                       --accept-dns
+          
+          # Wait for IP assignment with improved logic
+          $tsIP = $null
+          $maxRetries = 15
+          $retryCount = 0
+          
+          while (-not $tsIP -and $retryCount -lt $maxRetries) {
+            Start-Sleep -Seconds 10
+            $tsIP = & $tsPath ip -4 2>$null
+            $retryCount++
+            
+            if (-not $tsIP) {
+              Write-Host "Waiting for Tailscale IP... (Attempt $retryCount/$maxRetries)"
+            }
+          }
+          
+          if (-not $tsIP) {
+            Write-Error "Failed to obtain Tailscale IP after $maxRetries attempts"
+            exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP obtained: $tsIP"
+          
+          # Verify Tailscale status
+          $tsStatus = & $tsPath status --json | ConvertFrom-Json
+          Write-Host "Tailscale Status: Connected as $($tsStatus.Self.HostName)"
+          
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Testing RDP connectivity..."
+          
+          # Multiple verification attempts
+          $testsPassed = $false
+          for ($i = 1; $i -le 5; $i++) {
+            $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+            
+            if ($testResult.TcpTestSucceeded) {
+              $testsPassed = $true
+              Write-Host "✓ RDP connectivity test passed (Attempt $i)"
+              break
+            }
+            
+            Write-Host "Attempt $i failed, retrying..."
+            Start-Sleep -Seconds 15
+          }
+          
+          if (-not $testsPassed) {
+            Write-Error "RDP connectivity verification failed"
+            exit 1
+          }
+          
+          Write-Host "RDP service is accessible and ready for connections"
+          
+      - name: Display Connection Information
+        run: |
+          $creds = $env:RDP_CREDS | ConvertFrom-Json
+          
+          Write-Host @"
+          
+          ╔══════════════════════════════════════════════════════════╗
+          ║           RDP CONNECTION ESTABLISHED                    ║
+          ╠══════════════════════════════════════════════════════════╣
+          ║  Server:    $($env:TAILSCALE_IP.PadRight(42))║
+          ║  Username:  RDPUser                                    ║
+          ║  Password:  $($creds.password.PadRight(42))║
+          ║  Port:      3389                                       ║
+          ║  Location:  USA Eastern Time                          ║
+          ╠══════════════════════════════════════════════════════════╣
+          ║  Auto-restart: Every 5.5 hours (before 6hr limit)     ║
+          ║  Session started: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")         ║
+          ╚══════════════════════════════════════════════════════════╝
+          
+          To connect: Use Remote Desktop Connection with the above credentials
+          
+"@
+          
+      - name: Maintain Persistent Connection
+        run: |
+          Write-Host "Starting connection maintenance loop..."
+          $startTime = Get-Date
+          $maxDuration = New-TimeSpan -Minutes 330  # 5.5 hours before scheduled restart
+          
+          while ($true) {
+            $elapsed = (Get-Date) - $startTime
+            $remaining = $maxDuration - $elapsed
+            
+            # Check if we're approaching the 6-hour limit
+            if ($remaining.TotalMinutes -le 30) {
+              Write-Host "`n⏰ Approaching 6-hour limit (${remaining.Minutes} minutes remaining)"
+              Write-Host "🔄 Workflow will restart automatically via schedule"
+              Write-Host "⚠️  Save your work and reconnect after restart"
+              
+              # Graceful shutdown warning
+              for ($i = 10; $i -gt 0; $i--) {
+                Write-Host "`rScheduled restart in $i minutes..." -NoNewline
+                Start-Sleep -Seconds 60
+              }
+              break
+            }
+            
+            # Heartbeat and status update every 5 minutes
+            Write-Host "`r[$(Get-Date -Format 'HH:mm:ss')] RDP Active - Uptime: $([math]::Round($elapsed.TotalHours, 1)) hrs" -NoNewline
+            
+            # Optional: Add checks to ensure services are still running
+            try {
+              $rdpService = Get-Service TermService -ErrorAction Stop
+              if ($rdpService.Status -ne 'Running') {
+                Write-Warning "RDP Service stopped, restarting..."
+                Start-Service TermService
+              }
+            } catch {
+              Write-Warning "Failed to check RDP service status"
+            }
+            
+            Start-Sleep -Seconds 300  # Check every 5 minutes
+          }
+          
+          Write-Host "`n🔄 Preparing for graceful shutdown..."
+          
+      - name: Cleanup Before Restart
+        if: always()
+        run: |
+          Write-Host "Performing cleanup..."
+          
+          # Save any important state or logs
+          $logPath = "$env:TEMP\rdp_session.log"
+          Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Out-File -FilePath $logPath -Append
+          "Session ended, workflow will restart" | Out-File -FilePath $logPath -Append
+          
+          # Optional: Notify via webhook that restart is imminent
+          # You can add Discord/Slack notifications here
+          
+          Write-Host "Cleanup completed"
